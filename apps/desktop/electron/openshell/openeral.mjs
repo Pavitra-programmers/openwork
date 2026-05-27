@@ -1,40 +1,55 @@
-// OpenEral sandbox lifecycle. The upstream openeral maintainers'
-// recipe runs everything (provision + Claude Code REPL) in one
-// `openshell sandbox create --tty -- openeral` from an interactive
-// shell. We can't do that headlessly: createOpenEralSandbox runs via
-// wslRun (piped stdio, no TTY), so passing `-- openeral` as the
-// trailing command would deadlock — Claude Code's first-run "Use this
-// API key?" prompt has no terminal to read from, ssh eventually
-// times out, sandbox create returns exit 1.
+// OpenEral sandbox lifecycle.
 //
-// Two-step shape we use instead:
+// Canonical openeral launch (per the maintainers' SKILL.md and
+// openeral-js/src/cli.ts ≈ 1867) is a SINGLE interactive command:
 //
-//   1. `openshell sandbox create --no-tty ... -- /bin/true`
-//      Provisions the container, uploads /sandbox/db-url, returns as
-//      soon as /bin/true exits (≈ container-ready time).
+//   openshell sandbox create --tty \
+//     --name <name> \
+//     --from ghcr.io/sandys/openeral/sandbox:just-bash \
+//     --upload <db-url-file>:/sandbox/db-url \
+//     --provider claude --auto-providers \
+//     -- openeral
 //
-//   2. `openshell sandbox exec <name> --tty -- openeral`
-//      Spawned by openeral-pty.mjs (node-pty) or openeral-terminal.mjs
-//      (external terminal emulator). Both give the wsl.exe child a
-//      real PTY, so Claude Code's prompt is answerable on first run
-//      and /home/agent persists the answer for re-connects.
+// That call BLOCKS until the user exits Claude Code. Provisioning,
+// setup.sh, and the agent REPL all happen inside one TTY-attached
+// process. The maintainers' own tests in openeral-js explicitly assert
+// that `openshell sandbox exec` is NOT a real subcommand — we must not
+// split provisioning and launch via that path.
 //
-// Other invariants:
-//   - DATABASE_URL is staged as a FILE (one file, not a directory) in
-//     the distro at /tmp/openeral-db-url-<uuid> and uploaded to
-//     /sandbox/db-url. The openeral image's setup.sh reads it from
-//     there at first `openeral` exec.
+// We can't drive the canonical recipe from `wslRun` (piped stdio):
+// Claude Code's first-run prompts ("Use this API key?", theme, trust
+// /sandbox, security ack) need a real TTY. So we structure things as:
+//
+//   1. `createOpenEralSandbox` does PRE-FLIGHT only — validates creds,
+//      pulls the image, checks whether the sandbox already exists, and
+//      stages DATABASE_URL into a persistent file inside the distro
+//      (NOT /tmp — see STAGING_DIR comment). It does NOT call
+//      `openshell sandbox create`.
+//
+//   2. `buildSandboxLaunchSpec` returns the wsl.exe argv + env that
+//      the PTY layer (openeral-pty.mjs via node-pty, or openeral-
+//      terminal.mjs via an OS terminal emulator) actually executes.
+//      For a fresh sandbox the argv is the canonical
+//      `openshell sandbox create --tty ... -- openeral`; for a reconnect
+//      it's `openshell sandbox connect <name>` (the PTY layer is then
+//      responsible for injecting `exec openeral\r` so the connect-shell
+//      relaunches the agent inside the existing /home/agent state).
+//
+// Invariants:
+//   - DATABASE_URL stages as a FILE under /home/banker/.openwork-staging
+//     (mode 600, banker-owned). Uploads to /sandbox/db-url. setup.sh
+//     reads either /sandbox/openeral-input/db-url or /sandbox/db-url;
+//     we use the latter to keep the --upload shape a single file:dst.
 //   - ANTHROPIC_API_KEY rides in via env + WSLENV; --auto-providers
 //     auto-creates the `claude` provider from it at create time.
 //   - No --gateway flag: relies on the active selected gateway, which
 //     the installer registers via `gateway add --local --name openshell`
 //     and selects via `gateway select`.
-//   - The rootfs MUST include openssh-client — openshell shells out
-//     to ssh/scp for upload, connect, exec, download.
+//   - The rootfs MUST include openssh-client — openshell shells out to
+//     ssh/scp for upload, connect, download.
 
 import { randomUUID } from "node:crypto";
 
-import { getCliInfo } from "./cli.mjs";
 import { getCredential } from "./openeral-credentials.mjs";
 import { DISTRO_NAME, wslRun, wslSpawn } from "./wsl.mjs";
 
@@ -45,8 +60,18 @@ const IMAGE_BY_PROFILE = {
 };
 
 const DEFAULT_PULL_TIMEOUT_MS = 10 * 60_000;
-const DEFAULT_CREATE_TIMEOUT_MS = 3 * 60_000;
 const DEFAULT_PROBE_TIMEOUT_MS = 15_000;
+const DB_STAGE_TIMEOUT_MS = 15_000;
+
+// DATABASE_URL stages under banker's home, not /tmp. Two reasons:
+//   (a) /tmp namespacing diverges between wsl.exe sessions on banker
+//       distros under systemd's PrivateTmp — a file written by one
+//       wsl.exe call can be ENOENT from the next, and we stage from
+//       one wsl.exe call (createOpenEralSandbox pre-flight) but consume
+//       from another (the node-pty-spawned sandbox create).
+//   (b) banker's home is mode 700 by default, so the secret bytes hit
+//       disk only behind the user's own permissions.
+const STAGING_DIR = "/home/banker/.openwork-staging";
 
 // Docker pulls happen under user `banker` inside the distro. If Docker
 // Desktop's WSL integration ever ran for this distro (or runs again on
@@ -341,16 +366,83 @@ function shellQuote(value) {
 }
 
 /**
- * Create (or resume into) an OpenEral sandbox. Sandbox naming is stable
- * per-workspace — re-running with the same name on the same Postgres
- * is OpenEral's whole portability story.
+ * Stage DATABASE_URL into a fresh per-launch file inside the distro.
+ * The bytes flow through wsl.exe stdin (memory only) into a 0600 file
+ * under banker's home. The PTY launch script's bash `trap` rms the file
+ * when the agent process exits; if that trap doesn't fire (PTY killed
+ * abruptly), the main-process `unstageDatabaseUrl` cleanup callback
+ * removes it. Both paths are idempotent.
+ *
+ * Returns the absolute Linux path of the staged file.
+ */
+async function stageDatabaseUrl(databaseUrl) {
+  const dbPath = `${STAGING_DIR}/db-url-${randomUUID()}`;
+  const script = [
+    "set -e",
+    "umask 077",
+    `mkdir -p ${STAGING_DIR}`,
+    `cat > ${dbPath}`,
+    `chmod 600 ${dbPath}`,
+  ].join("\n");
+  const r = await wslRun(
+    ["-d", DISTRO_NAME, "--", "bash", "-c", script],
+    { timeout: DB_STAGE_TIMEOUT_MS, stdin: databaseUrl },
+  );
+  if (r.exitCode !== 0) {
+    throw new Error(
+      `Could not stage DATABASE_URL inside distro: ${(r.stderr || r.stdout).trim() || "(no output)"}`,
+    );
+  }
+  return dbPath;
+}
+
+/**
+ * Best-effort removal of a staging file. The launch script's bash trap
+ * also rms it, so this is idempotent — calling it after a clean exit is
+ * a no-op.
+ */
+export async function unstageDatabaseUrl(dbPath) {
+  if (!dbPath || !dbPath.startsWith(STAGING_DIR)) return;
+  await wslRun(
+    ["-d", DISTRO_NAME, "--", "rm", "-f", dbPath],
+    { timeout: 10_000 },
+  ).catch(() => {
+    // Best-effort.
+  });
+}
+
+/**
+ * Pre-flight an OpenEral sandbox launch. Does NOT call
+ * `openshell sandbox create` — that has to run with a real TTY and is
+ * the PTY layer's responsibility (see buildSandboxLaunchSpec).
+ *
+ * Steps:
+ *   - Probe whether the sandbox already exists. If yes, wait for it to
+ *     reach Ready phase so a subsequent `sandbox connect` doesn't race
+ *     a restart.
+ *   - Validate credentials are set.
+ *   - Pull the image if needed.
+ *   - Stage DATABASE_URL into a fresh file inside the distro.
+ *
+ * Returns the launch context that openeral-pty.mjs / openeral-terminal.mjs
+ * pass to `buildSandboxLaunchSpec` to build the canonical openshell
+ * invocation. Sandbox naming is stable per-workspace — same name on the
+ * same Postgres is OpenEral's portability story.
  *
  * @param {Object} opts
  * @param {string} opts.name
  * @param {"openeral-claude"|"openeral-openclaw"} opts.profile
  * @param {(evt: {phase: string, message: string}) => void} [opts.onProgress]
  * @param {boolean} [opts.skipImagePull]  Skip the docker pull (testing)
- * @param {number} [opts.createTimeoutMs]
+ * @returns {Promise<{
+ *   name: string,
+ *   profile: "openeral-claude"|"openeral-openclaw",
+ *   imageRef: string,
+ *   existed: boolean,
+ *   dbStagingPath: string | null,
+ *   anthropicApiKey: string | null,
+ *   stringcostApiKey: string | null,
+ * }>}
  */
 export async function createOpenEralSandbox(opts) {
   const { name, profile, onProgress, skipImagePull = false } = opts;
@@ -359,15 +451,23 @@ export async function createOpenEralSandbox(opts) {
 
   const imageRef = imageForProfile(profile);
 
-  // Short-circuit if the sandbox already exists (workspace reopen).
-  // Wait for it to reach Ready state before returning so the subsequent
-  // PTY exec doesn't fail with "phase: Provisioning".
+  // Short-circuit if the sandbox already exists. Wait for Ready so a
+  // subsequent `sandbox connect` doesn't race a restart. Reconnect
+  // doesn't need DATABASE_URL (already in the sandbox) or any image pull.
   if (await sandboxExists(name)) {
     onProgress?.({ phase: "exists", message: `Sandbox ${name} already exists; waiting for it to be ready…` });
     await waitForSandboxReady(name, {
       onProgress: (evt) => onProgress?.({ phase: evt.phase, message: evt.message }),
     });
-    return { name, profile, imageRef, existed: true };
+    return {
+      name,
+      profile,
+      imageRef,
+      existed: true,
+      dbStagingPath: null,
+      anthropicApiKey: null,
+      stringcostApiKey: null,
+    };
   }
 
   // Validate credentials.
@@ -384,6 +484,8 @@ export async function createOpenEralSandbox(opts) {
     );
   }
 
+  const stringcostApiKey = await getCredential("stringcostApiKey");
+
   // Image pull (~1.5 GB on first run for :just-bash).
   if (!skipImagePull) {
     onProgress?.({ phase: "pull", message: `Pulling ${imageRef}...` });
@@ -392,12 +494,108 @@ export async function createOpenEralSandbox(opts) {
     });
   }
 
-  // Forward credentials into the Linux side of WSL via WSLENV.
-  // ANTHROPIC_API_KEY is always forwarded so --auto-providers can
-  // auto-create the `claude` provider. For openclaw, also forward
-  // OPENERAL_AGENT=openclaw so the openeral wrapper picks the right
-  // agent at runtime.
-  const stringcostApiKey = await getCredential("stringcostApiKey");
+  // Stage DATABASE_URL into a persistent path inside the distro. The
+  // PTY launch script will `--upload` it to /sandbox/db-url when it
+  // runs `openshell sandbox create` with a real TTY.
+  onProgress?.({ phase: "stage", message: "Staging credentials inside distro..." });
+  const dbStagingPath = await stageDatabaseUrl(databaseUrl);
+  onProgress?.({ phase: "ready", message: `Sandbox ${name} ready to launch.` });
+
+  return {
+    name,
+    profile,
+    imageRef,
+    existed: false,
+    dbStagingPath,
+    anthropicApiKey,
+    stringcostApiKey,
+  };
+}
+
+/**
+ * Build the wsl.exe argv + env for spawning an OpenEral session inside
+ * a real PTY. Two shapes:
+ *
+ *   - existed=false (first launch): canonical single-step recipe:
+ *
+ *       trap 'rm -f <dbStagingPath>' EXIT
+ *       openshell sandbox create --tty \
+ *         --name <name> --from <imageRef> \
+ *         --upload <dbStagingPath>:/sandbox/db-url \
+ *         --provider claude --auto-providers \
+ *         -- openeral
+ *
+ *     ANTHROPIC_API_KEY (and optionally STRINGCOST_API_KEY) ride in via
+ *     env + WSLENV so --auto-providers picks them up at create time.
+ *     The bash trap removes the staging file when sandbox create finally
+ *     returns (when the user exits the agent REPL).
+ *
+ *   - existed=true (reconnect): `openshell sandbox connect <name>`.
+ *     Drops into a shell where setup.sh's bashrc rewrite has set
+ *     HOME=/home/agent. The caller is responsible for writing
+ *     `reconnectStdinInjection` (`exec openeral\r`) to the PTY's stdin
+ *     so the agent relaunches against the existing /home/agent state.
+ *
+ * Why NOT `openshell sandbox exec`: the openeral maintainers' tests
+ * (openeral-js/src/cli.test.ts:129) explicitly assert that subcommand
+ * is not real. The previous OpenWork shape used `sandbox exec --tty
+ * -- bash -c '... exec openeral'`, which "kind of" launched Claude
+ * Code but left stdin disconnected from the container PTY — the
+ * symptom users reported as "Claude loads but I can't type." The
+ * canonical single-step recipe above doesn't have that problem
+ * because openshell wires the host TTY directly into the container.
+ *
+ * @param {Object} spec
+ * @param {string} spec.name
+ * @param {"openeral-claude"|"openeral-openclaw"} spec.profile
+ * @param {string} spec.imageRef
+ * @param {boolean} spec.existed
+ * @param {string | null} spec.dbStagingPath  Required when !existed
+ * @param {string | null} [spec.anthropicApiKey]  Required when !existed
+ * @param {string | null} [spec.stringcostApiKey]  Optional cost-tracking key
+ * @returns {{
+ *   args: string[],
+ *   env: NodeJS.ProcessEnv,
+ *   dbStagingPath: string | null,
+ *   reconnectStdinInjection: string | null,
+ * }}
+ */
+export function buildSandboxLaunchSpec(spec) {
+  const {
+    name,
+    profile,
+    imageRef,
+    existed,
+    dbStagingPath,
+    anthropicApiKey,
+    stringcostApiKey,
+  } = spec;
+  if (!name) throw new Error("buildSandboxLaunchSpec: name is required");
+
+  if (existed) {
+    return {
+      args: ["-d", DISTRO_NAME, "--", "openshell", "sandbox", "connect", name],
+      env: process.env,
+      dbStagingPath: null,
+      reconnectStdinInjection: "exec openeral\r",
+    };
+  }
+
+  if (!imageRef) {
+    throw new Error("buildSandboxLaunchSpec: imageRef is required for fresh launch");
+  }
+  if (!dbStagingPath) {
+    throw new Error("buildSandboxLaunchSpec: dbStagingPath is required for fresh launch");
+  }
+  if (!anthropicApiKey) {
+    throw new Error(
+      "buildSandboxLaunchSpec: anthropicApiKey is required for fresh launch (used by --auto-providers)",
+    );
+  }
+
+  // Provider arg: claude for both profiles. For openclaw, OPENERAL_AGENT
+  // is injected via WSLENV — the image's setup.sh dispatches on it.
+  // STRINGCOST_API_KEY is forwarded so setup.sh can create the presign.
   const forwarded = { ANTHROPIC_API_KEY: anthropicApiKey };
   if (stringcostApiKey) {
     forwarded.STRINGCOST_API_KEY = stringcostApiKey;
@@ -407,119 +605,27 @@ export async function createOpenEralSandbox(opts) {
   }
   const env = buildWslEnvForwarding(forwarded);
 
-  // Staging the DATABASE_URL file AND running `openshell sandbox
-  // create` happen in ONE bash session — two separate wsl.exe calls
-  // can land in different /tmp namespaces on some banker distros, so
-  // openshell would see ENOENT trying to upload a file that "existed"
-  // from our staging call's perspective. One bash subshell keeps /tmp
-  // consistent for both the cat write and the --upload read.
-  //
-  // We deliberately do NOT pass `-- openeral` as the trailing command:
-  // `openshell sandbox create` BLOCKS until the trailing command exits,
-  // but `openeral` launches Claude Code (an interactive REPL that
-  // never exits), and we have no TTY here (wslRun is piped). That used
-  // to deadlock until ssh timed out with `exit status 1`. Instead we
-  // run `-- /bin/true` to provision the sandbox, return immediately,
-  // and rely on `sandbox exec --tty -- openeral` from openeral-pty.mjs
-  // / openeral-terminal.mjs to launch the REPL inside a real PTY.
-  //
-  // Note: openshell's --upload (and connect/exec/download) shells out
-  // to `ssh`/`scp` locally. The rootfs Dockerfile MUST include
-  // openssh-client or every sandbox operation fails with a cryptic
-  // "Error: × No such file or directory (os error 2)" from the failed
-  // exec.
-  const dbPath = `/tmp/openeral-db-url-${randomUUID()}`;
-  // Keep the create command simple — use `-- /bin/true` so openshell
-  // returns as soon as provisioning is done (no trailing command to race
-  // against the --auto-providers setup).
-  //
-  // openshell CLI 0.0.42 has a race: when --auto-providers is combined
-  // with a non-trivial `-- CMD`, the provider finalisation and the CMD
-  // exec both touch the gateway concurrently and one of them returns
-  // gRPC NotFound, aborting the create with exit 1.  Using `-- /bin/true`
-  // (exits in ~0 ms) avoids the window where the race can manifest.
-  //
-  // ANTHROPIC_API_KEY delivery for setup.sh's StringCost presign step:
-  // we write /sandbox/anthropic-api-key via a separate `sandbox exec`
-  // call AFTER create, so there is no quoting complexity inside the
-  // create command.  setup.sh falls back gracefully if the exec fails
-  // (it skips the presign step when ANTHROPIC_API_KEY is a placeholder).
-  // NOTE: do NOT use `exec openshell sandbox create ...` here.
-  // `exec` replaces the bash process, which means the EXIT trap set
-  // below never fires and the temp DB-URL file leaks in /tmp forever.
-  // Running openshell as a regular child (no exec) lets bash honour
-  // the trap on exit — whether the create succeeds or fails.
+  // `openshell sandbox create` blocks until the trailing command
+  // (openeral) exits. The bash EXIT trap rms the staging file after
+  // openshell returns. We deliberately do NOT `exec openshell ...`
+  // here — `exec` would replace bash and the trap would never fire.
   const script = [
     "set -e",
-    "umask 077",
-    // DATABASE_URL is piped via stdin — never touches the command line.
-    `cat > ${dbPath}`,
-    `chmod 600 ${dbPath}`,
-    // Staging file is removed on exit whether create succeeds or fails.
-    `trap 'rm -f ${dbPath}' EXIT`,
-    `openshell sandbox create --no-tty ` +
+    `trap 'rm -f ${dbStagingPath}' EXIT`,
+    `openshell sandbox create --tty ` +
       `--name ${shellQuote(name)} ` +
       `--from ${shellQuote(imageRef)} ` +
-      `--upload ${dbPath}:/sandbox/db-url ` +
+      `--upload ${dbStagingPath}:/sandbox/db-url ` +
       `--provider claude --auto-providers ` +
-      `-- /bin/true`,
+      `-- openeral`,
   ].join("\n");
 
-  onProgress?.({ phase: "create", message: `Creating sandbox ${name}…` });
-  let r;
-  try {
-    r = await wslRun(
-      ["-d", DISTRO_NAME, "--", "bash", "-c", script],
-      {
-        timeout: opts.createTimeoutMs ?? DEFAULT_CREATE_TIMEOUT_MS,
-        env,
-        stdin: databaseUrl,
-      },
-    );
-  } catch (err) {
-    if (/wsl\.exe timed out/i.test(err?.message ?? "")) {
-      throw new Error(
-        `openshell sandbox create timed out after 3 minutes. ` +
-          `The OpenShell gateway or Docker daemon is not responding. ` +
-          `Open Settings \u2192 Sandbox \u2192 OpenShell health and click Restart Gateway, then retry.`,
-      );
-    }
-    throw err;
-  }
-  if (r.exitCode !== 0) {
-    const output = (r.stderr || r.stdout).trim();
-    // openshell exits 1 with "already exists" when sandboxExists() returned
-    // a false-negative (e.g. unexpected JSON shape from sandbox list). Treat
-    // this as a successful reconnect instead of a hard failure.
-    if (/already exists/i.test(output)) {
-      onProgress?.({ phase: "exists", message: `Sandbox ${name} already exists; reconnecting.` });
-      return { name, profile, imageRef, existed: true };
-    }
-    const cli = await getCliInfo().catch(() => null);
-    const versionTag = cli?.version ? ` [CLI ${cli.version}]` : "";
-    throw new Error(
-      `openshell sandbox create failed (exit ${r.exitCode})${versionTag}: ` +
-        `${output || "(no output)"}`,
-    );
-  }
-  // Write the API key file so setup.sh can create a StringCost presign
-  // with the real key (not the openshell:resolve:env:* placeholder).
-  // This runs as a separate exec AFTER create so there is no interaction
-  // with --auto-providers.  Non-fatal: if the exec fails, setup.sh
-  // skips the presign step and uses the placeholder / env-var fallback.
-  const writeKeyScript =
-    `openshell sandbox exec --name ${shellQuote(name)} -- ` +
-    `sh -c ${shellQuote(`mkdir -p /sandbox && printf %s ${shellQuote(anthropicApiKey)} > /sandbox/anthropic-api-key && chmod 600 /sandbox/anthropic-api-key`)}`;
-  await wslRun(["-d", DISTRO_NAME, "--", "bash", "-c", writeKeyScript], {
-    timeout: 30_000,
+  return {
+    args: ["-d", DISTRO_NAME, "--", "bash", "-c", script],
     env,
-  }).catch((e) => {
-    // Non-fatal — setup.sh has an explicit fallback for missing key file.
-    console.warn("[createOpenEralSandbox] key-file write via exec failed (non-fatal):", e.message);
-  });
-
-  onProgress?.({ phase: "ready", message: `Sandbox ${name} ready.` });
-  return { name, profile, imageRef, existed: false };
+    dbStagingPath,
+    reconnectStdinInjection: null,
+  };
 }
 
 export async function deleteOpenEralSandbox(name) {
@@ -593,6 +699,7 @@ export async function probeDatabaseUrl({ timeoutMs = DEFAULT_PROBE_TIMEOUT_MS } 
 
 export const __testing = {
   IMAGE_BY_PROFILE,
+  STAGING_DIR,
   buildWslEnvForwarding,
   shellQuote,
 };

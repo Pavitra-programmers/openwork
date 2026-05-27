@@ -169,26 +169,43 @@ test("createOpenEralSandbox: throws when ANTHROPIC_API_KEY missing (any profile)
   );
 });
 
-test("createOpenEralSandbox: short-circuits when sandbox already exists", async () => {
-  // listSandboxes returns our target name → existed=true, no create call.
+test("createOpenEralSandbox: short-circuits when sandbox already exists, returns sparse context", async () => {
+  // listSandboxes returns our target name → existed=true. Then
+  // waitForSandboxReady probes the list once more; with a flat-string
+  // entry it treats the sandbox as ready and returns. No DB staging,
+  // no image pull, no `sandbox create`.
   await credentials.setCredential("databaseUrl", "postgresql://test/db");
-  process.env.MOCK_WSL_STDOUT = JSON.stringify([{ name: "openeral-resume" }]);
+  process.env.MOCK_WSL_STDOUT = JSON.stringify(["openeral-resume"]);
   const result = await openeral.createOpenEralSandbox({
     name: "openeral-resume",
     profile: "openeral-claude",
     skipImagePull: true,
   });
   assert.equal(result.existed, true);
-  // Only one wsl call: the list probe.
+  assert.equal(result.dbStagingPath, null);
+  assert.equal(result.anthropicApiKey, null);
   const lines = readArgsLog();
-  assert.equal(lines.length, 1);
-  assert.match(lines[0], /openshell sandbox list --json/);
+  // Two list calls: existence probe + waitForSandboxReady's ready check.
+  assert.ok(
+    lines.every((l) => /openshell sandbox list --json/.test(l)),
+    `expected only list calls; got: ${JSON.stringify(lines)}`,
+  );
+  // Critically: no `sandbox create` (PTY layer's responsibility) and no
+  // DB URL staging (the existing sandbox already has it).
+  assert.equal(
+    lines.filter((l) => /openshell sandbox create/.test(l)).length,
+    0,
+  );
+  assert.equal(
+    lines.filter((l) => /openwork-staging\/db-url-/.test(l)).length,
+    0,
+  );
 });
 
-test("createOpenEralSandbox: claude profile builds canonical openeral argv", async () => {
+test("createOpenEralSandbox: pre-flights credentials + stages DB URL, returns launch context", async () => {
   await credentials.setCredential("databaseUrl", "postgresql://test/db");
   await credentials.setCredential("anthropicApiKey", "sk-ant-test");
-  // Mock always emits "[]" so sandbox list parses to empty.
+  // Mock always emits "[]" so sandbox list parses to empty (sandbox absent).
   process.env.MOCK_WSL_STDOUT = "[]";
   const result = await openeral.createOpenEralSandbox({
     name: "openeral-new",
@@ -196,7 +213,15 @@ test("createOpenEralSandbox: claude profile builds canonical openeral argv", asy
     skipImagePull: true,
   });
   assert.equal(result.existed, false);
+  assert.equal(result.name, "openeral-new");
+  assert.equal(result.profile, "openeral-claude");
   assert.equal(result.imageRef, "ghcr.io/sandys/openeral/sandbox:just-bash");
+  assert.match(
+    result.dbStagingPath ?? "",
+    /^\/home\/banker\/\.openwork-staging\/db-url-[\w-]+$/,
+    "staging path lives under the banker user's home, not /tmp",
+  );
+  assert.equal(result.anthropicApiKey, "sk-ant-test");
 
   const lines = readArgsLog();
 
@@ -208,62 +233,164 @@ test("createOpenEralSandbox: claude profile builds canonical openeral argv", asy
     "canonical openeral flow does not call `provider create` ahead of time",
   );
 
-  // The whole flow runs inside ONE bash -c invocation. The bash script
-  // is multi-line, so the mock log splits it into separate lines —
-  // assert on each line of the script independently.
+  // Pre-flight stages DATABASE_URL via one bash call against the distro:
+  // mkdir + cat + chmod. The staging path mirrors result.dbStagingPath.
   assert.ok(
-    lines.some((l) => /cat > \/tmp\/openeral-db-url-[\w-]+/.test(l)),
-    "expected DATABASE_URL staging via `cat > /tmp/openeral-db-url-<uuid>`",
+    lines.some((l) => /mkdir -p \/home\/banker\/\.openwork-staging/.test(l)),
+    "expected staging directory to be created under banker's home",
   );
   assert.ok(
-    lines.some((l) => /chmod 600 \/tmp\/openeral-db-url-[\w-]+/.test(l)),
+    lines.some((l) => /cat > \/home\/banker\/\.openwork-staging\/db-url-[\w-]+/.test(l)),
+    "expected DATABASE_URL staging via `cat > /home/banker/.openwork-staging/db-url-<uuid>`",
+  );
+  assert.ok(
+    lines.some((l) => /chmod 600 \/home\/banker\/\.openwork-staging\/db-url-[\w-]+/.test(l)),
     "expected chmod 600 on the staging file",
   );
-  assert.ok(
-    lines.some((l) => /trap 'rm -f \/tmp\/openeral-db-url-[\w-]+' EXIT/.test(l)),
-    "expected EXIT trap to clean up staging file",
-  );
-  // Should not regress to the mktemp+command-substitution shape.
-  assert.ok(
-    !lines.some((l) => /mktemp .*\$\(/.test(l)),
-    "should not use mktemp command-substitution (empty-variable trap)",
+
+  // Pre-flight must NOT actually run `openshell sandbox create` — that's
+  // the PTY layer's job, since sandbox create with `-- openeral` blocks
+  // until Claude Code exits and needs a real TTY.
+  assert.equal(
+    lines.filter((l) => /openshell sandbox create/.test(l)).length,
+    0,
+    "createOpenEralSandbox is pre-flight only; sandbox create runs inside the PTY",
   );
 
-  // Sandbox create matches the openeral README exactly. The args we
-  // splice via shellQuote (name, imageRef) appear single-quoted.
-  const createLine = lines.find((l) => /openshell sandbox create/.test(l));
-  assert.ok(createLine, `no create line. lines=${JSON.stringify(lines)}`);
-  assert.match(createLine, /sandbox create --tty/);
-  assert.match(createLine, /--name 'openeral-new'/);
-  assert.match(createLine, /--from 'ghcr\.io\/sandys\/openeral\/sandbox:just-bash'/);
-  assert.match(createLine, /--upload \/tmp\/openeral-db-url-[\w-]+:\/sandbox\/db-url/);
-  assert.match(createLine, /--provider claude --auto-providers/);
-  assert.match(createLine, /-- openeral$/);
-  // Things that should NOT be there.
-  assert.doesNotMatch(createLine, /--gateway/, "no --gateway flag in canonical flow");
-  assert.doesNotMatch(createLine, /--no-tty/, "canonical flow uses --tty, not --no-tty");
-  assert.doesNotMatch(createLine, /--provider db/, "no explicit db provider");
+  // The dropped `openshell sandbox exec` path must not return either.
+  assert.equal(
+    lines.filter((l) => /openshell sandbox exec/.test(l)).length,
+    0,
+    "openshell sandbox exec is NOT a real subcommand (openeral-js asserts the same)",
+  );
 });
 
-test("createOpenEralSandbox: openclaw profile sets OPENERAL_AGENT env via WSLENV", async () => {
+test("createOpenEralSandbox: openclaw profile returns anthropicApiKey and image ref", async () => {
   await credentials.setCredential("databaseUrl", "postgresql://test/db");
   await credentials.setCredential("anthropicApiKey", "sk-ant-xxx");
   process.env.MOCK_WSL_STDOUT = "[]";
-  await openeral.createOpenEralSandbox({
+  const result = await openeral.createOpenEralSandbox({
     name: "openeral-claws",
     profile: "openeral-openclaw",
     skipImagePull: true,
   });
-  // We can't directly observe WSLENV from the mock log (it sets env
-  // for wsl.exe, not in argv). buildWslEnvForwarding is exercised in
-  // its own test above. Here just confirm the openclaw create line is
-  // structurally identical to the claude path.
-  const lines = readArgsLog();
-  const createLine = lines.find((l) => /openshell sandbox create/.test(l));
-  assert.ok(createLine);
-  assert.match(createLine, /--name 'openeral-claws'/);
-  assert.match(createLine, /--provider claude --auto-providers/);
-  assert.match(createLine, /-- openeral$/);
+  assert.equal(result.existed, false);
+  assert.equal(result.profile, "openeral-openclaw");
+  assert.equal(result.imageRef, "ghcr.io/sandys/openeral/sandbox:just-bash");
+  assert.equal(result.anthropicApiKey, "sk-ant-xxx");
+  assert.ok(result.dbStagingPath);
+});
+
+// ── buildSandboxLaunchSpec ─────────────────────────────────────────────
+
+test("buildSandboxLaunchSpec: fresh launch builds canonical openshell sandbox create argv", () => {
+  const spec = openeral.buildSandboxLaunchSpec({
+    name: "openeral-new",
+    profile: "openeral-claude",
+    imageRef: "ghcr.io/sandys/openeral/sandbox:just-bash",
+    existed: false,
+    dbStagingPath: "/home/banker/.openwork-staging/db-url-abc",
+    anthropicApiKey: "sk-ant-test",
+  });
+  // wsl.exe argv shape: -d <distro> -- bash -c <script>
+  assert.equal(spec.args[0], "-d");
+  assert.equal(spec.args[1], "openwork-openshell");
+  assert.equal(spec.args[2], "--");
+  assert.equal(spec.args[3], "bash");
+  assert.equal(spec.args[4], "-c");
+  const script = spec.args[5];
+  assert.match(script, /sandbox create --tty/);
+  assert.match(script, /--name 'openeral-new'/);
+  assert.match(script, /--from 'ghcr\.io\/sandys\/openeral\/sandbox:just-bash'/);
+  assert.match(
+    script,
+    /--upload \/home\/banker\/\.openwork-staging\/db-url-abc:\/sandbox\/db-url/,
+  );
+  assert.match(script, /--provider claude --auto-providers/);
+  assert.match(script, /-- openeral$/m);
+  assert.match(
+    script,
+    /trap 'rm -f \/home\/banker\/\.openwork-staging\/db-url-abc' EXIT/,
+    "expected EXIT trap to clean up staging file",
+  );
+  // Things that should NOT be there.
+  assert.doesNotMatch(script, /--gateway/, "no --gateway flag in canonical flow");
+  assert.doesNotMatch(script, /--no-tty/, "canonical flow uses --tty, not --no-tty");
+  assert.doesNotMatch(
+    script,
+    /sandbox exec/,
+    "`sandbox exec` is not a real openshell subcommand (per openeral-js tests)",
+  );
+  assert.doesNotMatch(script, /-- \/bin\/true/, "trailing command is openeral, not /bin/true");
+  // Env carries the API key + WSLENV forwarding.
+  assert.equal(spec.env.ANTHROPIC_API_KEY, "sk-ant-test");
+  assert.ok(spec.env.WSLENV.split(":").includes("ANTHROPIC_API_KEY"));
+  assert.equal(spec.reconnectStdinInjection, null);
+});
+
+test("buildSandboxLaunchSpec: openclaw fresh launch adds OPENERAL_AGENT to env", () => {
+  const spec = openeral.buildSandboxLaunchSpec({
+    name: "openeral-claws",
+    profile: "openeral-openclaw",
+    imageRef: "ghcr.io/sandys/openeral/sandbox:just-bash",
+    existed: false,
+    dbStagingPath: "/home/banker/.openwork-staging/db-url-xyz",
+    anthropicApiKey: "sk-ant-test",
+  });
+  assert.equal(spec.env.OPENERAL_AGENT, "openclaw");
+  assert.ok(spec.env.WSLENV.split(":").includes("OPENERAL_AGENT"));
+  assert.ok(spec.env.WSLENV.split(":").includes("ANTHROPIC_API_KEY"));
+});
+
+test("buildSandboxLaunchSpec: reconnect path uses `openshell sandbox connect` and queues an `exec openeral` injection", () => {
+  const spec = openeral.buildSandboxLaunchSpec({
+    name: "openeral-existing",
+    profile: "openeral-claude",
+    imageRef: "ghcr.io/sandys/openeral/sandbox:just-bash",
+    existed: true,
+    dbStagingPath: null,
+    anthropicApiKey: null,
+  });
+  assert.deepEqual(spec.args, [
+    "-d",
+    "openwork-openshell",
+    "--",
+    "openshell",
+    "sandbox",
+    "connect",
+    "openeral-existing",
+  ]);
+  assert.equal(spec.dbStagingPath, null);
+  // The PTY layer writes this string to stdin once the connect-shell
+  // prompt renders — relaunches the agent against /home/agent state.
+  assert.equal(spec.reconnectStdinInjection, "exec openeral\r");
+});
+
+test("buildSandboxLaunchSpec: fresh launch rejects missing dbStagingPath / anthropicApiKey", () => {
+  assert.throws(
+    () =>
+      openeral.buildSandboxLaunchSpec({
+        name: "x",
+        profile: "openeral-claude",
+        imageRef: "img",
+        existed: false,
+        dbStagingPath: null,
+        anthropicApiKey: "sk-ant",
+      }),
+    /dbStagingPath is required/,
+  );
+  assert.throws(
+    () =>
+      openeral.buildSandboxLaunchSpec({
+        name: "x",
+        profile: "openeral-claude",
+        imageRef: "img",
+        existed: false,
+        dbStagingPath: "/p",
+        anthropicApiKey: null,
+      }),
+    /anthropicApiKey is required/,
+  );
 });
 
 test("createOpenEralSandbox: requires name and profile", async () => {
@@ -279,12 +406,17 @@ test("createOpenEralSandbox: requires name and profile", async () => {
 
 // ── deleteOpenEralSandbox ──────────────────────────────────────────────
 
-test("deleteOpenEralSandbox: passes --force and name through", async () => {
+test("deleteOpenEralSandbox: invokes the bash-wrapped openshell sandbox delete <name>", async () => {
   process.env.MOCK_WSL_STDOUT = "";
   await openeral.deleteOpenEralSandbox("openeral-foo");
   const lines = readArgsLog();
   assert.equal(lines.length, 1);
-  assert.match(lines[0], /openshell sandbox delete openeral-foo --force/);
+  // Wrapped in `bash -c "timeout 20 openshell sandbox delete '<name>'"`
+  // so a hung gateway is force-killed at the inner timer rather than
+  // tripping wslRun's outer one. --force is intentionally NOT passed —
+  // openshell 0.0.45 errors on the unknown flag.
+  assert.match(lines[0], /timeout \d+ openshell sandbox delete 'openeral-foo'/);
+  assert.doesNotMatch(lines[0], /--force/, "openshell sandbox delete does not accept --force");
 });
 
 test("deleteOpenEralSandbox: rejects empty name", async () => {
@@ -305,9 +437,14 @@ test("probeDatabaseUrl: runs psql in postgres:16-alpine and returns reachable", 
   assert.equal(r.reachable, true);
   const lines = readArgsLog();
   assert.equal(lines.length, 1);
-  assert.match(lines[0], /docker run --rm -i -e PGCONNECT_TIMEOUT=10 postgres:16-alpine psql/);
+  // docker is wrapped with `docker --config <dir>` to dodge Docker
+  // Desktop's credential helper (see pullImage comment).
+  assert.match(
+    lines[0],
+    /docker --config \S+ run --rm -i -e PGCONNECT_TIMEOUT=10 postgres:16-alpine psql/,
+  );
   assert.match(lines[0], /postgresql:\/\/test\/db/);
-  assert.match(lines[0], /-tAc select 1/);
+  assert.match(lines[0], /-tAc 'select 1'/);
 });
 
 test("probeDatabaseUrl: surfaces psql error stderr", async () => {

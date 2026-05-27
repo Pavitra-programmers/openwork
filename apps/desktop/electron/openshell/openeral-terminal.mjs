@@ -1,8 +1,14 @@
-// External-terminal launcher for OpenEral sessions. Until the xterm.js
-// renderer view lands (deferred pending founder review of the session
-// UX shape), the only way to interact with a freshly-created OpenEral
-// sandbox is to spawn an OS terminal window that runs
-// `wsl -d openwork-openshell -- openshell sandbox connect <name>`.
+// External-terminal launcher for OpenEral sessions. Same launch spec
+// as the in-app xterm.js path (see openeral-pty.mjs); we just hand the
+// argv off to an OS terminal emulator instead of node-pty. Both shapes
+// need a real TTY so Claude Code's first-run prompts are answerable.
+//
+// Reconnect caveat: the in-app PTY path can inject `exec openeral\r`
+// once the connect-shell prompt appears. The external terminal can't
+// (no stdin handle after spawn), so for reconnects the user has to
+// type `openeral` (or `claude`) in the connect shell themselves. That's
+// acceptable for the "pop out" feature, which is supplementary to the
+// in-app terminal.
 //
 // Platforms:
 //   - Windows: Windows Terminal (wt.exe) if available, else cmd.exe.
@@ -15,7 +21,7 @@
 import { spawn } from "node:child_process";
 import process from "node:process";
 
-import { DISTRO_NAME } from "./wsl.mjs";
+import { buildSandboxLaunchSpec } from "./openeral.mjs";
 
 const LINUX_TERMINAL_CANDIDATES = [
   // Each entry is { command, argsForCommand(cmd, args) → string[] }
@@ -54,56 +60,60 @@ function detectLinuxTerminal() {
 }
 
 /**
- * Spawn an OS terminal window running `wsl -d <distro> -- openshell
- * sandbox connect <name>`. Returns once the terminal launch has been
- * dispatched — does NOT wait for the user to close it.
+ * Spawn an OS terminal window running the canonical openshell sandbox
+ * launch (create + openeral on first launch, connect on reconnect).
+ * Returns once the terminal launch has been dispatched — does NOT wait
+ * for the user to close it.
  *
  * Throws if no terminal could be launched.
  *
- * @param {string} sandboxName
+ * @param {Object} launchInfo
+ * @param {string} launchInfo.sandboxName
+ * @param {"openeral-claude"|"openeral-openclaw"} launchInfo.profile
+ * @param {string} launchInfo.imageRef
+ * @param {boolean} launchInfo.existed
+ * @param {string | null} launchInfo.dbStagingPath
+ * @param {string | null} [launchInfo.anthropicApiKey]
+ * @param {string | null} [launchInfo.stringcostApiKey]
  * @param {{ windowTitle?: string }} [options]
  */
-export async function launchExternalTerminalToSandbox(sandboxName, options = {}) {
-  if (!sandboxName) throw new Error("launchExternalTerminalToSandbox: sandboxName is required");
-  const windowTitle = options.windowTitle ?? `OpenWork — ${sandboxName}`;
+export async function launchExternalTerminalToSandbox(launchInfo, options = {}) {
+  if (!launchInfo?.sandboxName) {
+    throw new Error("launchExternalTerminalToSandbox: sandboxName is required");
+  }
+  const windowTitle = options.windowTitle ?? `OpenWork — ${launchInfo.sandboxName}`;
+
+  const spec = buildSandboxLaunchSpec({
+    name: launchInfo.sandboxName,
+    profile: launchInfo.profile,
+    imageRef: launchInfo.imageRef,
+    existed: !!launchInfo.existed,
+    dbStagingPath: launchInfo.dbStagingPath ?? null,
+    anthropicApiKey: launchInfo.anthropicApiKey ?? null,
+    stringcostApiKey: launchInfo.stringcostApiKey ?? null,
+  });
 
   if (process.platform === "win32") {
-    return launchWindowsTerminal(sandboxName, windowTitle);
+    return launchWindowsTerminal(spec, windowTitle);
   }
   if (process.platform === "darwin") {
-    return launchMacOSTerminal(sandboxName, windowTitle);
+    return launchMacOSTerminal(spec, windowTitle);
   }
-  return launchLinuxTerminal(sandboxName, windowTitle);
+  return launchLinuxTerminal(spec, windowTitle);
 }
 
-function launchWindowsTerminal(sandboxName, windowTitle) {
+function launchWindowsTerminal(spec, windowTitle) {
   // Try Windows Terminal first. The `wt.exe` shim accepts `--title`
-  // and runs `wsl.exe -d ... -- openshell sandbox connect <name>`
-  // directly as the command. If wt isn't installed (older Win11
-  // installs), fall back to cmd.exe /K so the window stays open after
-  // the connect command exits.
-  // `sandbox connect` doesn't accept a trailing command. Use `exec
-  // --tty -- openeral` so the external terminal launches Claude Code
-  // directly inside a real PTY (the terminal emulator allocates one
-  // for the wsl.exe child).
-  const wslArgs = [
-    "-d",
-    DISTRO_NAME,
-    "--",
-    "openshell",
-    "sandbox",
-    "exec",
-    "--name",
-    sandboxName,
-    "--tty",
-    "--",
-    "openeral",
-  ];
+  // and runs the wsl.exe argv directly as the command. If wt isn't
+  // installed (older Win11 installs), fall back to cmd.exe so the
+  // window stays open while the wsl command runs.
+  const wslArgs = spec.args;
+  const env = spec.env ?? process.env;
 
   const wtChild = spawn(
     "wt.exe",
     ["--title", windowTitle, "wsl.exe", ...wslArgs],
-    { detached: true, stdio: "ignore", windowsHide: false },
+    { detached: true, stdio: "ignore", windowsHide: false, env },
   );
   return new Promise((resolve, reject) => {
     wtChild.once("error", () => {
@@ -111,7 +121,7 @@ function launchWindowsTerminal(sandboxName, windowTitle) {
       const cmdChild = spawn(
         "cmd.exe",
         ["/C", "start", `"${windowTitle}"`, "wsl.exe", ...wslArgs],
-        { detached: true, stdio: "ignore", windowsHide: false, shell: true },
+        { detached: true, stdio: "ignore", windowsHide: false, shell: true, env },
       );
       cmdChild.once("error", reject);
       cmdChild.unref();
@@ -123,7 +133,7 @@ function launchWindowsTerminal(sandboxName, windowTitle) {
   });
 }
 
-function launchMacOSTerminal(sandboxName, windowTitle) {
+function launchMacOSTerminal(_spec, _windowTitle) {
   // osascript opens Terminal.app and runs a command. We can't directly
   // run wsl on macOS (it doesn't exist) but the sandbox-connect target
   // is wsl-resident, so this path is dev-only and runs against a
@@ -139,26 +149,11 @@ function launchMacOSTerminal(sandboxName, windowTitle) {
   );
 }
 
-async function launchLinuxTerminal(sandboxName, windowTitle) {
+async function launchLinuxTerminal(spec, _windowTitle) {
   // Linux is dev convenience only — banker laptops are Windows. Probe a
   // list of common terminal emulators in priority order.
-  // `sandbox connect` doesn't accept a trailing command. Use `exec
-  // --tty -- openeral` so the external terminal launches Claude Code
-  // directly inside a real PTY (the terminal emulator allocates one
-  // for the wsl.exe child).
-  const wslArgs = [
-    "-d",
-    DISTRO_NAME,
-    "--",
-    "openshell",
-    "sandbox",
-    "exec",
-    "--name",
-    sandboxName,
-    "--tty",
-    "--",
-    "openeral",
-  ];
+  const wslArgs = spec.args;
+  const env = spec.env ?? process.env;
   const candidates = detectLinuxTerminal();
   for (const cand of candidates) {
     const args = cand.build("wsl.exe", wslArgs);
@@ -166,6 +161,7 @@ async function launchLinuxTerminal(sandboxName, windowTitle) {
       const child = spawn(cand.exe, args, {
         detached: true,
         stdio: "ignore",
+        env,
       });
       // Sync error from missing binary fires within a tick.
       const launched = await new Promise((resolve) => {

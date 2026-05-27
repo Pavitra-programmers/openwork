@@ -1619,10 +1619,12 @@ export function createRuntimeManager({ app, desktopRoot, listLocalWorkspacePaths
       const workspaceId =
         String(options.workspaceId ?? "").trim() || path.basename(workspacePath);
       const sandboxName = deriveOpenEralSandboxName(workspaceId);
-      const result = await openeral.createOpenEralSandbox({
-        name: sandboxName,
-        profile: sandboxProfile,
-      });
+      // Lightweight existence probe only. Full pre-flight (creds check,
+      // image pull, DATABASE_URL staging) happens in the openeralEnsureSandbox
+      // IPC handler the renderer calls when it mounts <OpenEralTerminal>.
+      // We avoid running pre-flight here so we don't stage two DB URL
+      // files (one orphaned) for the same launch.
+      const existed = await openeral.sandboxExists(sandboxName).catch(() => false);
       const hostInfo = {
         openworkUrl: null,
         token: null,
@@ -1633,7 +1635,7 @@ export function createRuntimeManager({ app, desktopRoot, listLocalWorkspacePaths
         sandboxProfile,
         sandboxRunId: sandboxName,
         sandboxContainerName: sandboxName,
-        openeralExisted: result.existed,
+        openeralExisted: existed,
         terminalLaunch: null,
         terminalError: null,
       };

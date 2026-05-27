@@ -287,6 +287,48 @@ function emitOpenEralPtyExit(sessionId, exitCode, signal) {
   }
 }
 
+// Pending OpenEral launch contexts keyed by sandbox name. Populated by
+// openeralEnsureSandbox / openeralStartSession (which do pre-flight),
+// consumed by openeralPtyOpen / openeralPopOutTerminal (which need the
+// full launch spec — imageRef, dbStagingPath, anthropicApiKey, etc. —
+// to build the canonical `openshell sandbox create --tty ... -- openeral`
+// argv inside node-pty's real TTY).
+//
+// Lifecycle: each ensureSandbox call populates the context for that
+// sandbox. The matching ptyOpen consumes it and clears the entry — the
+// staging file is owned by the PTY session's lifetime from that point.
+// If the renderer remounts between ensure and ptyOpen (rare), the
+// caller passes workspaceId+profile so main can re-run pre-flight.
+const openeralLaunchContexts = new Map();
+
+async function preparePendingLaunch({ workspaceId, profile, emitProgress = true }) {
+  const sandboxName = deriveOpenEralSandboxName(workspaceId);
+  const onProgress = emitProgress
+    ? (evt) =>
+        emitOpenEralSessionProgress({
+          sandboxName,
+          phase: evt.phase,
+          message: evt.message,
+        })
+    : undefined;
+  const result = await openeral.createOpenEralSandbox({
+    name: sandboxName,
+    profile,
+    onProgress,
+  });
+  const context = {
+    sandboxName: result.name,
+    profile: result.profile,
+    imageRef: result.imageRef,
+    existed: result.existed,
+    dbStagingPath: result.dbStagingPath,
+    anthropicApiKey: result.anthropicApiKey,
+    stringcostApiKey: result.stringcostApiKey,
+  };
+  openeralLaunchContexts.set(sandboxName, context);
+  return { result, context, sandboxName };
+}
+
 function normalizePlatform(value) {
   if (value === "darwin" || value === "linux") return value;
   if (value === "win32") return "windows";
@@ -1637,10 +1679,12 @@ async function handleDesktopInvoke(event, command, ...args) {
     case "openeralStartSession": {
       // Per spec O3+O4 contract:
       //   1. Derive sandbox name from workspaceId (stable across machines).
-      //   2. createOpenEralSandbox: create or short-circuit if it exists,
-      //      streams pull + create progress via openeral:session-progress.
-      //   3. Launch the OS terminal pointed at `openshell sandbox connect <name>`.
-      //   4. Return {sandboxName, profile, existed, terminal} to the renderer.
+      //   2. preparePendingLaunch: pre-flight (creds check, image pull,
+      //      stage DATABASE_URL, probe existence). Streams progress via
+      //      openeral:session-progress.
+      //   3. Launch the OS terminal running the canonical openshell
+      //      sandbox create (fresh) / connect (reconnect) recipe.
+      //   4. Return {sandboxName, profile, existed, terminal}.
       const input = args[0] ?? {};
       const workspaceId = String(input.workspaceId ?? "").trim();
       const profile = String(input.profile ?? "").trim();
@@ -1655,15 +1699,9 @@ async function handleDesktopInvoke(event, command, ...args) {
         phase: "starting",
         message: "Preparing OpenEral sandbox...",
       });
-      const result = await openeral.createOpenEralSandbox({
-        name: sandboxName,
+      const { result, context } = await preparePendingLaunch({
+        workspaceId,
         profile,
-        onProgress: (evt) =>
-          emitOpenEralSessionProgress({
-            sandboxName,
-            phase: evt.phase,
-            message: evt.message,
-          }),
       });
       emitOpenEralSessionProgress({
         sandboxName,
@@ -1672,7 +1710,7 @@ async function handleDesktopInvoke(event, command, ...args) {
       });
       let terminal;
       try {
-        terminal = await launchExternalTerminalToSandbox(sandboxName);
+        terminal = await launchExternalTerminalToSandbox(context);
       } catch (err) {
         // Sandbox is up but we couldn't open a terminal. Don't fail the
         // whole session — surface the issue so the user can launch
@@ -1736,47 +1774,69 @@ async function handleDesktopInvoke(event, command, ...args) {
       return deriveOpenEralSandboxName(workspaceId);
     }
     case "openeralPtyOpen": {
-      // Renderer xterm.js requests a PTY to an existing sandbox. We
-      // spawn `wsl -d openwork-openshell -- openshell sandbox exec <name>
-      // --tty -- openeral` inside a real PTY (node-pty) and forward stdout
+      // Renderer xterm.js requests a PTY into an OpenEral sandbox. We
+      // spawn the canonical openshell invocation (`sandbox create --tty
+      // -- openeral` for a fresh sandbox; `sandbox connect <name>` for
+      // a reconnect) inside a real PTY (node-pty) and forward stdout
       // bytes via the openeral:pty-data event channel.
+      //
+      // The launch context (imageRef, dbStagingPath, anthropicApiKey,
+      // existed) is normally populated by an earlier openeralEnsureSandbox
+      // call. If it's missing (renderer remount), we recompute pre-flight
+      // on the fly using workspaceId+profile from the IPC payload.
       const input = args[0] ?? {};
       const sandboxName = String(input.sandboxName ?? "").trim();
       if (!sandboxName) throw new Error("sandboxName is required");
       const cols = Number.isFinite(input.cols) ? input.cols : undefined;
       const rows = Number.isFinite(input.rows) ? input.rows : undefined;
 
-      // Read credentials from safeStorage and forward them into the sandbox
-      // via WSLENV. This is essential so the `openeral` entrypoint can
-      // auto-configure Claude Code's Anthropic provider on first run without
-      // showing an interactive "enter API key" prompt that the user can't
-      // see or respond to (especially when the terminal is still sizing up).
-      const extraEnv = {};
-      try {
-        const anthropicApiKey = await openeralCredentials.getCredential("anthropicApiKey");
-        if (anthropicApiKey) extraEnv.ANTHROPIC_API_KEY = anthropicApiKey;
-      } catch { /* safeStorage may be unavailable in some test environments */ }
-      try {
-        const stringcostApiKey = await openeralCredentials.getCredential("stringcostApiKey");
-        if (stringcostApiKey) extraEnv.STRINGCOST_API_KEY = stringcostApiKey;
-      } catch { /* optional — StringCost tracking only */ }
-      // Forward terminal dimensions as COLUMNS/LINES so Claude Code (and any
-      // other program in the container that checks env vars before TIOCGWINSZ)
-      // gets the right width from the start. Belt-and-suspenders alongside the
-      // `stty cols X rows Y` call in openeral-pty.mjs's spawnImpl.
-      const effectiveCols = Number.isFinite(cols) && cols > 0 ? cols : 120;
-      const effectiveRows = Number.isFinite(rows) && rows > 0 ? rows : 32;
-      extraEnv.COLUMNS = String(effectiveCols);
-      extraEnv.LINES = String(effectiveRows);
+      let context = openeralLaunchContexts.get(sandboxName);
+      if (!context) {
+        const workspaceId = String(input.workspaceId ?? "").trim();
+        const profile = String(input.profile ?? "").trim();
+        if (!workspaceId || !profile) {
+          throw new Error(
+            "openeralPtyOpen: no pending launch context for " +
+              `${sandboxName}; renderer must call openeralEnsureSandbox first ` +
+              `or pass workspaceId+profile so pre-flight can re-run.`,
+          );
+        }
+        if (profile !== "openeral-claude" && profile !== "openeral-openclaw") {
+          throw new Error(`Unsupported OpenEral profile: ${profile}`);
+        }
+        await assertOpenShellReady();
+        ({ context } = await preparePendingLaunch({
+          workspaceId,
+          profile,
+          emitProgress: true,
+        }));
+      }
+
+      // Per-session cleanup: remove the staging file when the PTY exits.
+      // The launch script's bash trap also rms it, so this is idempotent.
+      const dbStagingPath = context.dbStagingPath;
+      const cleanup = dbStagingPath
+        ? () => openeral.unstageDatabaseUrl(dbStagingPath)
+        : null;
 
       const result = await openeralPty.openSession({
         sandboxName,
+        profile: context.profile,
+        imageRef: context.imageRef,
+        existed: context.existed,
+        dbStagingPath: context.dbStagingPath,
+        anthropicApiKey: context.anthropicApiKey,
+        stringcostApiKey: context.stringcostApiKey,
         cols,
         rows,
-        extraEnv: Object.keys(extraEnv).length > 0 ? extraEnv : undefined,
+        cleanup,
         onData: (data) => emitOpenEralPtyData(result.id, data),
         onExit: (exitCode, signal) => emitOpenEralPtyExit(result.id, exitCode, signal),
       });
+      // The PTY now owns the launch. Clear the pending context — a
+      // subsequent reconnect re-runs ensureSandbox, which sees
+      // existed=true and populates a fresh (sparse) context.
+      openeralLaunchContexts.delete(sandboxName);
       return result;
     }
     case "openeralPtyWrite": {
@@ -1802,7 +1862,10 @@ async function handleDesktopInvoke(event, command, ...args) {
     case "openeralEnsureSandbox": {
       // Same as openeralStartSession but WITHOUT launching an external
       // terminal — the renderer's xterm.js component connects via the
-      // PTY IPC handlers instead. Returns {sandboxName, existed, profile}.
+      // PTY IPC handlers instead. Returns the renderer-safe subset of
+      // the launch context and stashes the full context (including
+      // anthropicApiKey + dbStagingPath) main-side for the subsequent
+      // openeralPtyOpen call.
       const input = args[0] ?? {};
       const workspaceId = String(input.workspaceId ?? "").trim();
       const profile = String(input.profile ?? "").trim();
@@ -1811,21 +1874,14 @@ async function handleDesktopInvoke(event, command, ...args) {
         throw new Error(`Unsupported OpenEral profile: ${profile}`);
       }
       await assertOpenShellReady();
-      const sandboxName = deriveOpenEralSandboxName(workspaceId);
       emitOpenEralSessionProgress({
-        sandboxName,
+        sandboxName: deriveOpenEralSandboxName(workspaceId),
         phase: "ensuring",
         message: "Ensuring OpenEral sandbox is up...",
       });
-      const result = await openeral.createOpenEralSandbox({
-        name: sandboxName,
+      const { result, sandboxName } = await preparePendingLaunch({
+        workspaceId,
         profile,
-        onProgress: (evt) =>
-          emitOpenEralSessionProgress({
-            sandboxName,
-            phase: evt.phase,
-            message: evt.message,
-          }),
       });
       emitOpenEralSessionProgress({
         sandboxName,
@@ -1834,21 +1890,53 @@ async function handleDesktopInvoke(event, command, ...args) {
           ? `Reconnecting to ${sandboxName}.`
           : `Sandbox ${sandboxName} ready.`,
       });
-      return { ...result, sandboxName };
+      // Only the renderer-safe subset crosses the IPC boundary.
+      // anthropicApiKey and dbStagingPath stay in the main process.
+      return {
+        name: result.name,
+        sandboxName,
+        profile: result.profile,
+        existed: result.existed,
+        imageRef: result.imageRef,
+      };
     }
     case "openeralPopOutTerminal": {
       // Renderer's "Pop out to external terminal" button. Opens a
       // second connection to the same sandbox in a new OS terminal
       // window — additive to the in-app xterm.js, not a replacement.
-      const sandboxName = String(args[0] ?? "").trim();
+      // Accepts either a bare sandboxName (legacy) or
+      // {sandboxName, workspaceId, profile} so we can rebuild the
+      // launch context if the in-app PTY already consumed it.
+      const input = args[0] ?? {};
+      const sandboxName = String(
+        typeof input === "string" ? input : input.sandboxName ?? "",
+      ).trim();
       if (!sandboxName) throw new Error("sandboxName is required");
+      let context = openeralLaunchContexts.get(sandboxName);
+      if (!context) {
+        const workspaceId = String(
+          typeof input === "string" ? "" : input.workspaceId ?? "",
+        ).trim();
+        const profile = String(
+          typeof input === "string" ? "" : input.profile ?? "",
+        ).trim();
+        if (!workspaceId || !profile) {
+          throw new Error(
+            "openeralPopOutTerminal: pass {sandboxName, workspaceId, profile} " +
+              "so the launch context can be rebuilt if needed.",
+          );
+        }
+        ({ context } = await preparePendingLaunch({
+          workspaceId,
+          profile,
+          emitProgress: false,
+        }));
+      }
       try {
-        const terminal = await launchExternalTerminalToSandbox(sandboxName);
+        const terminal = await launchExternalTerminalToSandbox(context);
         return terminal;
       } catch (err) {
-        throw new Error(
-          err instanceof Error ? err.message : String(err),
-        );
+        throw new Error(err instanceof Error ? err.message : String(err));
       }
     }
     case "openshellResetDistro": {

@@ -72,8 +72,7 @@ test.afterEach(() => {
 
 test("openSession: spawns with the given sandbox name + size + returns id", async () => {
   const result = await pty.openSession({
-    sandboxName: "openeral-demo",
-    cols: 100,
+    sandboxName: "openeral-demo", existed: true,    cols: 100,
     rows: 30,
   });
   assert.ok(result.id);
@@ -84,7 +83,7 @@ test("openSession: spawns with the given sandbox name + size + returns id", asyn
 });
 
 test("openSession: defaults to 120x32 when cols/rows omitted", async () => {
-  await pty.openSession({ sandboxName: "x" });
+  await pty.openSession({ sandboxName: "x", existed: true });
   assert.equal(lastSpawnArgs.cols, 120);
   assert.equal(lastSpawnArgs.rows, 32);
 });
@@ -96,8 +95,7 @@ test("openSession: rejects empty sandbox name", async () => {
 test("openSession: forwards PTY data to onData callback", async () => {
   const received = [];
   await pty.openSession({
-    sandboxName: "x",
-    onData: (data) => received.push(data),
+    sandboxName: "x", existed: true,    onData: (data) => received.push(data),
   });
   activeFake.emit("hello world\n");
   activeFake.emit("more\n");
@@ -107,7 +105,7 @@ test("openSession: forwards PTY data to onData callback", async () => {
 test("openSession: tracks the session in listSessions", async () => {
   const before = pty.listSessions();
   assert.equal(before.length, 0);
-  const result = await pty.openSession({ sandboxName: "openeral-demo" });
+  const result = await pty.openSession({ sandboxName: "openeral-demo", existed: true });
   const after = pty.listSessions();
   assert.equal(after.length, 1);
   assert.equal(after[0].id, result.id);
@@ -121,7 +119,7 @@ test("openSession: tracks the session in listSessions", async () => {
 // ── writeSession ───────────────────────────────────────────────────────
 
 test("writeSession: forwards string data to the PTY", async () => {
-  const { id } = await pty.openSession({ sandboxName: "x" });
+  const { id } = await pty.openSession({ sandboxName: "x", existed: true });
   const ok = pty.writeSession(id, "ls\n");
   assert.equal(ok, true);
   assert.deepEqual(activeFake.events.writes, ["ls\n"]);
@@ -133,7 +131,7 @@ test("writeSession: returns false for unknown session", () => {
 });
 
 test("writeSession: coerces non-string input to string", async () => {
-  const { id } = await pty.openSession({ sandboxName: "x" });
+  const { id } = await pty.openSession({ sandboxName: "x", existed: true });
   pty.writeSession(id, 42);
   assert.deepEqual(activeFake.events.writes, ["42"]);
 });
@@ -141,20 +139,20 @@ test("writeSession: coerces non-string input to string", async () => {
 // ── resizeSession ──────────────────────────────────────────────────────
 
 test("resizeSession: forwards new size to the PTY", async () => {
-  const { id } = await pty.openSession({ sandboxName: "x", cols: 80, rows: 24 });
+  const { id } = await pty.openSession({ sandboxName: "x", existed: true, cols: 80, rows: 24 });
   const ok = pty.resizeSession(id, 100, 40);
   assert.equal(ok, true);
   assert.deepEqual(activeFake.events.resizes, [{ cols: 100, rows: 40 }]);
 });
 
 test("resizeSession: no-op when size hasn't changed (skips SIGWINCH)", async () => {
-  const { id } = await pty.openSession({ sandboxName: "x", cols: 80, rows: 24 });
+  const { id } = await pty.openSession({ sandboxName: "x", existed: true, cols: 80, rows: 24 });
   pty.resizeSession(id, 80, 24);
   assert.equal(activeFake.events.resizes.length, 0);
 });
 
 test("resizeSession: floors fractional sizes", async () => {
-  const { id } = await pty.openSession({ sandboxName: "x", cols: 80, rows: 24 });
+  const { id } = await pty.openSession({ sandboxName: "x", existed: true, cols: 80, rows: 24 });
   pty.resizeSession(id, 100.7, 40.3);
   assert.deepEqual(activeFake.events.resizes, [{ cols: 100, rows: 40 }]);
 });
@@ -164,7 +162,7 @@ test("resizeSession: returns false for unknown session", () => {
 });
 
 test("resizeSession: keeps previous size when called with NaN", async () => {
-  const { id } = await pty.openSession({ sandboxName: "x", cols: 80, rows: 24 });
+  const { id } = await pty.openSession({ sandboxName: "x", existed: true, cols: 80, rows: 24 });
   pty.resizeSession(id, NaN, NaN);
   assert.equal(activeFake.events.resizes.length, 0);
   const sessions = pty.listSessions();
@@ -175,19 +173,19 @@ test("resizeSession: keeps previous size when called with NaN", async () => {
 // ── closeSession ───────────────────────────────────────────────────────
 
 test("closeSession: kills the PTY with SIGTERM by default", async () => {
-  const { id } = await pty.openSession({ sandboxName: "x" });
+  const { id } = await pty.openSession({ sandboxName: "x", existed: true });
   pty.closeSession(id);
   assert.deepEqual(activeFake.events.kills, ["SIGTERM"]);
 });
 
 test("closeSession: accepts a custom signal", async () => {
-  const { id } = await pty.openSession({ sandboxName: "x" });
+  const { id } = await pty.openSession({ sandboxName: "x", existed: true });
   pty.closeSession(id, "SIGKILL");
   assert.deepEqual(activeFake.events.kills, ["SIGKILL"]);
 });
 
 test("closeSession: removes the session from the map when onExit fires", async () => {
-  const { id } = await pty.openSession({ sandboxName: "x" });
+  const { id } = await pty.openSession({ sandboxName: "x", existed: true });
   assert.equal(pty.listSessions().length, 1);
   pty.closeSession(id);
   // Simulate node-pty's onExit firing after kill.
@@ -204,15 +202,14 @@ test("closeSession: returns false for unknown session", () => {
 test("onExit handler fires with exit code + signal", async () => {
   const exits = [];
   await pty.openSession({
-    sandboxName: "x",
-    onExit: (code, signal) => exits.push({ code, signal }),
+    sandboxName: "x", existed: true,    onExit: (code, signal) => exits.push({ code, signal }),
   });
   activeFake.exit(7, "SIGTERM");
   assert.deepEqual(exits, [{ code: 7, signal: "SIGTERM" }]);
 });
 
 test("onExit removes the session from listSessions even without explicit close", async () => {
-  await pty.openSession({ sandboxName: "x" });
+  await pty.openSession({ sandboxName: "x", existed: true });
   assert.equal(pty.listSessions().length, 1);
   activeFake.exit(0);
   assert.equal(pty.listSessions().length, 0);
@@ -224,8 +221,7 @@ test("attachHandlers: replaces the onData handler for a live session", async () 
   const initial = [];
   const replacement = [];
   const { id } = await pty.openSession({
-    sandboxName: "x",
-    onData: (d) => initial.push(d),
+    sandboxName: "x", existed: true,    onData: (d) => initial.push(d),
   });
   activeFake.emit("first");
   pty.attachHandlers(id, { onData: (d) => replacement.push(d) });
@@ -237,8 +233,7 @@ test("attachHandlers: replaces the onData handler for a live session", async () 
 test("attachHandlers: leaves the existing handler in place when not specified", async () => {
   const received = [];
   const { id } = await pty.openSession({
-    sandboxName: "x",
-    onData: (d) => received.push(d),
+    sandboxName: "x", existed: true,    onData: (d) => received.push(d),
   });
   pty.attachHandlers(id, {}); // no replacement
   activeFake.emit("still-routed");
@@ -252,9 +247,9 @@ test("attachHandlers: returns false for unknown session", () => {
 // ── closeAllSessions ───────────────────────────────────────────────────
 
 test("closeAllSessions: kills every live PTY", async () => {
-  await pty.openSession({ sandboxName: "a" });
+  await pty.openSession({ sandboxName: "a", existed: true });
   const fakeA = activeFake;
-  await pty.openSession({ sandboxName: "b" });
+  await pty.openSession({ sandboxName: "b", existed: true });
   const fakeB = activeFake;
   assert.equal(pty.listSessions().length, 2);
   pty.closeAllSessions();
@@ -268,13 +263,11 @@ test("multiple sessions track distinct IPty instances", async () => {
   const aData = [];
   const bData = [];
   const { id: idA } = await pty.openSession({
-    sandboxName: "alpha",
-    onData: (d) => aData.push(d),
+    sandboxName: "alpha", existed: true,    onData: (d) => aData.push(d),
   });
   const fakeA = activeFake;
   const { id: idB } = await pty.openSession({
-    sandboxName: "bravo",
-    onData: (d) => bData.push(d),
+    sandboxName: "bravo", existed: true,    onData: (d) => bData.push(d),
   });
   const fakeB = activeFake;
   assert.notEqual(idA, idB);

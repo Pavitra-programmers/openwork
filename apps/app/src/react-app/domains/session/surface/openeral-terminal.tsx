@@ -331,9 +331,14 @@ export function OpenEralTerminal(props: OpenEralTerminalProps) {
 
         // 4. Open the PTY. Pass the current xterm size — now guaranteed
         // to be the result of a ResizeObserver-corrected fit() call.
+        // workspaceId + profile let main.mjs rebuild the launch context
+        // if the pending one (set by openeralEnsureSandbox above) was
+        // already consumed — e.g. after a renderer remount.
         setPhase("connecting-pty");
         const pty = await invoke<{ id: string }>("openeralPtyOpen", {
           sandboxName: sandbox.sandboxName,
+          workspaceId: props.workspaceId,
+          profile: props.profile,
           cols: term.cols,
           rows: term.rows,
         });
@@ -386,13 +391,19 @@ export function OpenEralTerminal(props: OpenEralTerminalProps) {
     setPopoutBusy(true);
     setPopoutError(null);
     try {
-      await invoke("openeralPopOutTerminal", name);
+      // Pass workspaceId + profile so main.mjs can rebuild the launch
+      // context if the in-app PTY already consumed the pending one.
+      await invoke("openeralPopOutTerminal", {
+        sandboxName: name,
+        workspaceId: props.workspaceId,
+        profile: props.profile,
+      });
     } catch (err) {
       setPopoutError(err instanceof Error ? err.message : String(err));
     } finally {
       setPopoutBusy(false);
     }
-  }, [sandboxName]);
+  }, [sandboxName, props.workspaceId, props.profile]);
 
   const deleteSandbox = useCallback(async () => {
     const nameToDelete = sandboxName ?? lastKnownSandboxNameRef.current;

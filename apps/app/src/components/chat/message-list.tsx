@@ -745,9 +745,16 @@ const UserMessage = React.memo(
                         )
                       }
                       if (isFileUIPart(part)) {
+                        // An attachment is identified by its position among the
+                        // message's files, not by its URL or filename: a sent image
+                        // first shows the composer's blob: preview, then the server's
+                        // recompressed data: copy. Keeping one element lets the
+                        // browser swap the bitmap in place instead of remounting an
+                        // <img> that has to decode before it can paint.
+                        const attachmentIndex = inlineParts.slice(0, index).filter(isFileUIPart).length
                         return (
                           <span
-                            key={`file-${part.url}-${index}`}
+                            key={`file-${attachmentIndex}`}
                             className="mx-1 inline-flex align-middle not-prose"
                           >
                             <FileMessage part={part} tone="user" />

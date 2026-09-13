@@ -1,5 +1,5 @@
 /** @jsxImportSource react */
-import { expect, mock, spyOn, test } from "bun:test";
+import { afterAll, expect, mock, spyOn, test } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createRequire } from "node:module";
@@ -16,6 +16,12 @@ import type {
   NewTaskComposerContext,
   NewTaskComposerHandoff,
 } from "../src/react-app/domains/session/chat/new-task-composer";
+
+const registeredDom = typeof globalThis.window === "undefined" || typeof globalThis.document === "undefined";
+if (registeredDom) GlobalRegistrator.register({ url: "http://localhost/" });
+afterAll(async () => {
+  if (registeredDom) await GlobalRegistrator.unregister();
+});
 
 const workspaceId = "workspace-focus-continuity";
 const sessionId = "session-focus-continuity";
@@ -77,7 +83,11 @@ async function waitFor(predicate: () => boolean, label: string) {
   throw new Error(`Timed out waiting for ${label}`);
 }
 
-test("composer focus, shared Restore, pending stops, and optimistic sends preserve drafts through snapshots and first-message handoff", async () => {
+test.each([
+  { name: "composer focus, shared Restore, pending stops, and optimistic sends preserve drafts through snapshots and first-message handoff", queueRegression: false },
+  { name: "busy Enter clears persisted composer text and attachments without losing queued messages or newer typing", queueRegression: true },
+])("$name", async ({ queueRegression }) => {
+  window.localStorage.clear();
   const require = createRequire(import.meta.url);
   // Bun's isolated test loader cycles Lexical's ESM entries; use their real CJS entries before the app imports the editor.
   for (const moduleId of [
@@ -114,8 +124,6 @@ test("composer focus, shared Restore, pending stops, and optimistic sends preser
     import("../src/react-app/domains/cloud/den-auth-provider"),
     import("../src/react-app/domains/cloud/desktop-config-provider"),
   ]);
-  const registeredDom = typeof globalThis.window === "undefined" || typeof globalThis.document === "undefined";
-  if (registeredDom) GlobalRegistrator.register({ url: "http://localhost/" });
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", {
     configurable: true,
     value: true,
@@ -357,6 +365,63 @@ test("composer focus, shared Restore, pending stops, and optimistic sends preser
     if (!editor) throw new Error("Expected the Lexical editor");
     editor.focus();
     expect(document.activeElement).toBe(editor);
+
+    if (queueRegression) {
+      const { getSessionDraft } = await import("../src/react-app/domains/session/sync/draft-store");
+      const { startQueuedDraftPersistence } = await import("../src/react-app/domains/session/sync/queued-draft-persistence");
+      const { $getRoot, getNearestEditorFromDOMNode } = await import("lexical");
+      const stopQueuedPersistence = startQueuedDraftPersistence();
+      const queuedFile = new File(["queued image"], "queued.png", { type: "image/png" });
+      const previewUrl = URL.createObjectURL(queuedFile);
+      const queuedAttachment: ComposerAttachment = {
+        id: "queued-image", name: queuedFile.name, mimeType: queuedFile.type, size: queuedFile.size,
+        kind: "image", file: queuedFile, previewUrl,
+      };
+      const queuedTexts: string[] = [];
+      try {
+        for (const withAttachment of [false, true]) {
+          const text = withAttachment ? "Queued with image" : "Queued text";
+          const composerText = withAttachment ? `${text}[attachment queued-image]` : text;
+          await act(async () => {
+            useComposerStateStore.getState().setAttachments(sessionId, withAttachment ? [queuedAttachment] : []);
+            useComposerStateStore.getState().setDraft(sessionId, composerText);
+          });
+          const lexicalEditor = getNearestEditorFromDOMNode(editor);
+          if (!lexicalEditor) throw new Error("Expected the mounted Lexical editor");
+          await act(async () => lexicalEditor.update(() => { $getRoot().selectEnd(); }, { discrete: true }));
+          expect(getSessionDraft("local", workspaceId, sessionId)?.text).toBe(text);
+          expect(container.querySelector('button[aria-label="Stop"]')).not.toBeNull();
+          await act(async () => {
+            editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+          });
+          queuedTexts.push(text);
+          const queued = useComposerStateStore.getState().queuedDrafts[sessionId];
+          expect(queued).toHaveLength(queuedTexts.length);
+          expect(editor.textContent).toBe("");
+          expect(useComposerStateStore.getState().sessions[sessionId]?.draft ?? "").toBe("");
+          expect(useComposerStateStore.getState().sessions[sessionId]?.attachments ?? []).toEqual([]);
+          expect(container.querySelector("[data-attachment-id]")).toBeNull();
+          expect(getSessionDraft("local", workspaceId, sessionId)).toEqual({ text: "", mode: "prompt", queued: queuedTexts });
+          expect(queued?.at(-1)?.draft.text).toBe(composerText);
+          expect(queued?.at(-1)?.draft.attachments).toEqual(withAttachment ? [queuedAttachment] : []);
+          expect(sentDrafts).toHaveLength(0);
+          expect(revokePreview).not.toHaveBeenCalledWith(previewUrl);
+          await act(async () => lexicalEditor.update(() => {
+            $getRoot().selectEnd().insertText("Newer typing after queue");
+          }, { discrete: true }));
+          await act(async () => renderSurface());
+          expect(container.querySelector('[data-lexical-editor="true"]')).toBe(editor);
+          expect(editor.textContent).toBe("Newer typing after queue");
+          expect(useComposerStateStore.getState().sessions[sessionId]?.draft).toBe("Newer typing after queue");
+          expect(getSessionDraft("local", workspaceId, sessionId)).toEqual({ text: "Newer typing after queue", mode: "prompt", queued: queuedTexts });
+          expect(useComposerStateStore.getState().queuedDrafts[sessionId]).toBe(queued);
+        }
+      } finally {
+        stopQueuedPersistence();
+        URL.revokeObjectURL(previewUrl);
+      }
+      return;
+    }
 
     // Hold both async boundaries: idle alone must not release Stop's feedback.
     let snapshotRefresh = Promise.withResolvers<void>();
@@ -1472,6 +1537,5 @@ test("composer focus, shared Restore, pending stops, and optimistic sends preser
     queryClient.clear();
     container.remove();
     mock.restore();
-    if (registeredDom) await GlobalRegistrator.unregister();
   }
 }, 10_000);

@@ -1034,6 +1034,7 @@ export function SessionSurface(props: SessionSurfaceProps) {
     scopeKey: persistedDraftKey,
     snapshot: persistedDraftSnapshot,
     save: persistDraft,
+    clear: clearPersistedDraft,
   } = useSessionDraftState(props.draftScope, props.workspaceId, props.sessionId);
   const appliedPersistedDraftRef = useRef<{
     scopeKey: string;
@@ -2131,9 +2132,10 @@ export function SessionSurface(props: SessionSurfaceProps) {
   }, [archived, archiveStateKnown, opencodeClient, openingHistory.ensureFullSnapshot, props.onSendDraft, props.opencodeBaseUrl, props.sessionId, props.workspaceId, props.workspaceRoot, removeQueuedDraftFromStore, renderedMessages.length, sessionOwner, setError]);
 
   const clearComposer = useCallback(() => {
+    clearPersistedDraft();
     clearComposerSession(props.sessionId);
     props.onDraftChange(buildDraft("", []));
-  }, [buildDraft, clearComposerSession, props.onDraftChange, props.sessionId]);
+  }, [buildDraft, clearComposerSession, clearPersistedDraft, props.onDraftChange, props.sessionId]);
 
   // Initial send (agent idle) and explicit "Steer" follow-up (agent busy)
   // share the same immediate path.

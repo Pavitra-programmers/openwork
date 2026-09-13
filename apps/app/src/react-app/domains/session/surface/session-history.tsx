@@ -264,6 +264,20 @@ export function useOpeningSessionHistory(input: OpeningHistoryInput & {
       return client.fetchQuery(options);
     }
   }, [client, input.snapshotQueryKey, fullReader]);
+  // A follow-up decides whether to interrupt delegated work from the current
+  // turn's newest messages. Cached complete history already holds them;
+  // otherwise one bounded newest read does. A send never waits on the uncapped
+  // read a saved reading position leaves in flight: on a cold engine that read
+  // can outlast its request timeout, and a timed-out read must not bounce the
+  // person's message back into the composer.
+  const readSendHistory = useCallback(async (): Promise<OpenworkSessionHistory["messages"]> => {
+    const cached = client.getQueryData<OpenworkSessionHistory>(input.snapshotQueryKey);
+    if (cached?.session.id === input.sessionId) return cached.messages;
+    if (!input.readLatest) return (await ensureFullSnapshot()).messages;
+    const latest = await input.readLatest(new AbortController().signal);
+    if (latest.session.id !== input.sessionId) throw new Error("Conversation history belongs to another session.");
+    return latest.messages;
+  }, [client, ensureFullSnapshot, input.readLatest, input.sessionId, input.snapshotQueryKey]);
   const runWithFullSnapshot = useCallback(async (
     action: (snapshot: OpenworkSessionHistory) => void | Promise<unknown>,
     options: { fresh?: boolean } = {},
@@ -312,6 +326,7 @@ export function useOpeningSessionHistory(input: OpeningHistoryInput & {
       ? !entry.warm || !input.readLatest || !latestQuery.isFetching
       : backgroundOwner === input.owner,
     ensureFullSnapshot,
+    readSendHistory,
     runWithFullSnapshot,
   };
 }

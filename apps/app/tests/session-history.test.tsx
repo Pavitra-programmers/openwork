@@ -99,6 +99,7 @@ function fixture() {
   document.body.append(host);
   const root = createRoot(host);
   let ensureFullSnapshot: (() => Promise<OpenworkSessionHistory>) | undefined;
+  let readSendHistory: ReturnType<typeof useOpeningSessionHistory>["readSendHistory"] | undefined;
   let runWithFullSnapshot: ReturnType<typeof useOpeningSessionHistory>["runWithFullSnapshot"] | undefined;
   const reads: { owner: string; authToken?: string; window?: OpeningHistoryWindow; signal: AbortSignal; resolve: (snapshot: OpenworkSessionHistory) => void; reject: (error: Error) => void }[] = [];
   const latestReads: { owner: string; authToken?: string; signal: AbortSignal; resolve: (history: Pick<OpenworkSessionHistory, "session" | "messages">) => void; reject: (error: Error) => void }[] = [];
@@ -117,6 +118,7 @@ function fixture() {
     const workspaceId = key[1];
     const opening = useOpeningSessionHistory(options);
     ensureFullSnapshot = opening.ensureFullSnapshot;
+    readSendHistory = opening.readSendHistory;
     runWithFullSnapshot = opening.runWithFullSnapshot;
     // The hero's one-step auto-send fires from a mount effect, before any read settled.
     useEffect(() => { onMount?.(opening.ensureFullSnapshot); }, [onMount, opening.ensureFullSnapshot]);
@@ -163,6 +165,10 @@ function fixture() {
     ensureFullSnapshot() {
       if (!ensureFullSnapshot) throw new Error("History is not mounted");
       return ensureFullSnapshot();
+    },
+    readSendHistory() {
+      if (!readSendHistory) throw new Error("History is not mounted");
+      return readSendHistory();
     },
     render(owner = "a", authToken?: string, cacheOwner = owner) { return renderInput(input(owner, authToken, cacheOwner)); },
     async resolve(index: number, title: string | OpenworkSessionHistory) {
@@ -617,6 +623,28 @@ describe("opening a thread", () => {
     expect((await sameRead).session.title).toBe("Full current turn");
     expect((await view.ensureFullSnapshot()).session.title).toBe("Full current turn");
     expect(view.reads).toHaveLength(2);
+  });
+
+  test("a send reads the current turn from cached complete history or one bounded newest read, never the uncapped read", async () => {
+    const view = fixture();
+    await view.render();
+    await view.resolve(0, "Reading preview");
+    // Cold thread: the preview may be an older saved region and the uncapped
+    // read is still in flight. The send takes the bounded newest read instead.
+    const pending = view.readSendHistory();
+    expect(view.reads.map((read) => read.window)).toEqual([{ limit: 24 }]);
+    expect(view.latestReads).toHaveLength(1);
+    await view.resolveLatest(0, snapshot("a", "Newest turn", ["older", "current"]));
+    expect((await pending).map(({ info }) => info.id)).toEqual(["older", "current"]);
+    // A newest read that belongs to another thread is refused, never sent with.
+    const foreign = view.readSendHistory().then(() => "sent", (error: unknown) => (error instanceof Error ? error.message : String(error)));
+    await view.resolveLatest(1, snapshot("b", "Other thread", ["x"]));
+    expect(await foreign).toBe("Conversation history belongs to another session.");
+    // Warm thread: cached complete history answers without any read.
+    view.client.setQueryData(snapshotKey("workspace", "a"), snapshot("a", "Complete", ["1", "2", "3"]));
+    expect((await view.readSendHistory()).map(({ info }) => info.id)).toEqual(["1", "2", "3"]);
+    expect(view.latestReads).toHaveLength(2);
+    expect(view.reads.filter((read) => read.window === undefined)).toHaveLength(0);
   });
 
   test("a send started from a mount effect survives StrictMode dropping and re-adding the reader mid-read", async () => {
